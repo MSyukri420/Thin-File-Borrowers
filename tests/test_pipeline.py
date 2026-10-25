@@ -1,19 +1,16 @@
 """Tests for src/io.py, src/preprocess.py and src/train.py.
 
-    python -m pytest test.py                  # everything (~3 min, real data included)
-    python -m pytest test.py -k "not RealData" # synthetic tests only (~2 s)
+    pytest                        # everything (~3 min, real data included)
+    pytest -k "not RealData"      # synthetic tests only (~2 s)
 
 The synthetic tests write tiny hand-made CSVs with known answers, so each cleaning
 and aggregation rule is checked exactly. The real-data tests run the full build on
 dataset/ and are skipped if the raw files are not there.
 
-The combined dataframes are written to output/ so the results can be inspected:
-    output/synthetic_combined.csv   the 3 synthetic applicants
-    output/combined.csv             the full real dataset
+To inspect a built dataset as a CSV: python -m src.preprocess --out output/combined.csv
 """
 
 import re
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -23,7 +20,6 @@ from src import io, preprocess, train
 
 NAN = np.nan
 SENTINEL = preprocess.DAYS_SENTINEL
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 
 # --------------------------------------------------------------------------- #
@@ -552,8 +548,8 @@ def test_save_pickle_round_trip(df, tmp_path):
     pd.testing.assert_frame_equal(pd.read_pickle(path), df)
 
 
-def test_write_synthetic_output_csv(df):
-    path = OUTPUT_DIR / "synthetic_combined.csv"
+def test_save_csv_round_trip(df, tmp_path):
+    path = tmp_path / "combined.csv"
     io.save_dataset(df.reset_index(), path)
     back = pd.read_csv(path)
     assert back.shape == df.reset_index().shape
@@ -610,9 +606,3 @@ class TestRealData:
     def test_counts_have_no_nan(self, real):
         count_cols = [c for c in real.columns if preprocess._COUNT_COL.search(c)]
         assert not real[count_cols].isna().any().any()
-
-    def test_write_output_csv(self, real):
-        path = OUTPUT_DIR / "combined.csv"
-        io.save_dataset(real, path)
-        back = pd.read_csv(path, usecols=["SK_ID_CURR"])
-        assert len(back) == len(real)

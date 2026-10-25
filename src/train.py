@@ -4,14 +4,17 @@ Usage:
     python -m src.train                      # feature set A (all features)
     python -m src.train --features B         # no bureau information
     python -m src.train --features C         # no bureau information and no outside scores
-    python -m src.train --data dataset/processed/combined_fe.pkl   # with engineered features
+    python -m src.train --data dataset/processed/combined.pkl      # raw features only
+    python -m src.train --features B --final # score the locked test set once
 
 Only labelled (train) applicants are used. 15% of them are locked away as a final test
-set (``split_holdout``) and never used here; cross-validation runs on the other 85%.
+set (``split_holdout``); cross-validation runs on the other 85%. ``--final`` trains one
+model on that 85% and scores the locked 15% once. It reports results and is never
+used to choose between versions.
 Every run uses the same holdout and the same stratified folds (fixed seed), so results
 from different feature sets and dataset versions can be compared directly.
 Results go to output/results/: a JSON summary, the out-of-fold predictions, and one
-row per run appended to log.csv.
+row per run appended to log.csv (final scores: final_*.json and final.csv).
 """
 
 import argparse
@@ -33,6 +36,7 @@ log = logging.getLogger(__name__)
 SEED = 42
 N_FOLDS = 5
 HOLDOUT_SIZE = 0.15
+N_BOOTSTRAP = 1000
 RESULTS_DIR = Path(__file__).resolve().parents[1] / "output" / "results"
 
 # Not features: an ID, the answer, and labels used to split the data and the results.
@@ -151,6 +155,17 @@ def evaluate(y, oof, folds, thin):
     return result
 
 
+def bootstrap_auc(y, pred, n=N_BOOTSTRAP, seed=SEED):
+    """95% interval for AUC from resampling applicants with replacement."""
+    rng = np.random.default_rng(seed)
+    aucs = []
+    for _ in range(n):
+        idx = rng.integers(0, len(y), len(y))
+        if y[idx].min() != y[idx].max():
+            aucs.append(roc_auc_score(y[idx], pred[idx]))
+    return [float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5))]
+
+
 def _append_log(summary):
     """One row per run in output/results/log.csv, to compare runs side by side."""
     row = {"time": time.strftime("%Y-%m-%d %H:%M"), "data": summary["data"],
@@ -202,14 +217,54 @@ def run(feature_set, data_path):
     return summary
 
 
+def final(feature_set, data_path):
+    """Train on the whole development set and score the locked test set once."""
+    start = time.perf_counter()
+    dev, holdout = split_holdout(load_train(data_path))
+    features = select_features(dev.columns, feature_set)
+    y_dev = dev["TARGET"].to_numpy()
+    fit_idx, stop_idx = train_test_split(np.arange(len(dev)), test_size=0.1, stratify=y_dev,
+                                         random_state=SEED)
+    model = lgb.LGBMClassifier(**PARAMS)
+    model.fit(dev[features].iloc[fit_idx], y_dev[fit_idx],
+              eval_X=dev[features].iloc[stop_idx], eval_y=y_dev[stop_idx], eval_metric="auc",
+              callbacks=[lgb.early_stopping(100, verbose=False)])
+
+    y, thin = holdout["TARGET"].to_numpy(), holdout["IS_THIN_FILE"].to_numpy()
+    pred = model.predict_proba(holdout[features])[:, 1]
+    summary = {"model": "lightgbm", "data": data_path.stem, "feature_set": feature_set,
+               "n_features": len(features), "trees": model.best_iteration_, "seed": SEED}
+    for name, mask in [("overall", np.ones(len(y), bool)), ("thin_file", thin == 1),
+                       ("has_bureau", thin == 0)]:
+        summary[name] = {"auc": roc_auc_score(y[mask], pred[mask]),
+                         "auc_95ci": bootstrap_auc(y[mask], pred[mask]),
+                         "applicants": int(mask.sum()), "default_rate": float(y[mask].mean())}
+        r = summary[name]
+        log.info("%-10s test AUC %.4f (95%% CI %.4f-%.4f), %d applicants", name, r["auc"],
+                 *r["auc_95ci"], r["applicants"])
+    summary["minutes"] = round((time.perf_counter() - start) / 60, 1)
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"final_{feature_set}_{data_path.stem}"
+    (RESULTS_DIR / f"{name}.json").write_text(json.dumps(summary, indent=2))
+    row = {"data": summary["data"], "feature_set": feature_set, "n_features": len(features)}
+    for group in ["overall", "has_bureau", "thin_file"]:
+        row[f"auc_{group}"] = round(summary[group]["auc"], 4)
+        row[f"ci_low_{group}"], row[f"ci_high_{group}"] = (round(v, 4) for v in summary[group]["auc_95ci"])
+    path = RESULTS_DIR / "final.csv"
+    pd.DataFrame([row]).to_csv(path, mode="a", header=not path.exists(), index=False)
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--features", choices=sorted(FEATURE_SETS), default="A")
-    parser.add_argument("--data", type=Path, default=io.DATA_DIR / "processed" / "combined.pkl")
+    parser.add_argument("--data", type=Path, default=io.DATA_DIR / "processed" / "combined_fe123.pkl")
+    parser.add_argument("--final", action="store_true", help="score the locked test set once")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    run(args.features, args.data)
+    (final if args.final else run)(args.features, args.data)
 
 
 if __name__ == "__main__":

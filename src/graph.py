@@ -1,11 +1,12 @@
-"""Charts for the experiments run by src/train.py, saved as PNGs in output/figures/.
+"""Charts for the experiments run by src/train.py, saved as PNGs in docs/figures/.
 
 Usage:
     python -m src.graph                          # main dataset combined_fe123, detail charts for B
     python -m src.graph --data combined --features C
 
 Reads output/results/ (log.csv, the per-run JSON summaries and out-of-fold predictions,
-and pruning_B_combined_fe123.json if present). A chart whose runs are missing is skipped.
+pruning_B_combined_fe123.json and the final_*.json test scores if present). A chart
+whose runs are missing is skipped.
 figure_data.csv holds every plotted number, as a table view of the charts.
 """
 
@@ -25,7 +26,7 @@ from . import train  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-FIGURES_DIR = train.RESULTS_DIR.parent / "figures"
+FIGURES_DIR = train.RESULTS_DIR.parents[1] / "docs" / "figures"
 
 # Dataset versions in the order the feature batches were added.
 STEPS = {"combined": "Raw", "combined_fe1": "+ Batch 1", "combined_fe12": "+ Batch 2",
@@ -150,6 +151,35 @@ def plot_auc_by_feature_set(runs, data):
     ax.set_title("AUC by feature set and applicant group", pad=22)
     _subtitle(ax, f"LightGBM, 5-fold CV on the 85% development set · bars = fold std · data: {data}")
     return _save(fig, "auc_by_feature_set")
+
+
+def plot_final_test(data):
+    """Dot plot: locked test-set AUC per feature set for each group, with bootstrap 95% CI."""
+    paths = [train.RESULTS_DIR / f"final_{s}_{data}.json" for s in SETS]
+    if not all(p.exists() for p in paths):
+        return None
+    finals = [json.loads(p.read_text()) for p in paths]
+    fig, ax = plt.subplots(figsize=(7.5, 4.4))
+    x = np.arange(len(SETS))
+    for i, group in enumerate(GROUPS):
+        auc = np.array([f[group]["auc"] for f in finals])
+        ci = np.array([f[group]["auc_95ci"] for f in finals])
+        pos = x + (i - 1) * 0.28
+        ax.errorbar(pos, auc, yerr=[auc - ci[:, 0], ci[:, 1] - auc], fmt="o", ms=8,
+                    color=GROUP_COLORS[group], elinewidth=1.5, capsize=0, markeredgecolor=SURFACE,
+                    markeredgewidth=1.5, label=GROUP_LABELS[group])
+        for p, v, (lo, hi), s in zip(pos, auc, ci, SETS):
+            ax.annotate(f"{v:.3f}", (p, v), xytext=(6, 0), textcoords="offset points",
+                        va="center", fontsize=8, color=INK_2)
+            _record("final_test", data=data, feature_set=s, group=group, auc=v, ci_low=lo, ci_high=hi)
+    ax.set_xticks(x, [SET_LABELS[s] for s in SETS])
+    ax.set_xlim(-0.6, len(SETS) - 0.3)
+    ax.set_ylabel("ROC-AUC")
+    ax.grid(axis="y")
+    ax.legend(loc="upper right", ncols=3, bbox_to_anchor=(1, -0.18), handletextpad=0.3)
+    ax.set_title("Final score on the locked 15% test set", pad=22)
+    _subtitle(ax, f"Scored once, after all choices were made · bars = bootstrap 95% CI · data: {data}")
+    return _save(fig, "final_test")
 
 
 def plot_engineering_progression(runs):
@@ -334,6 +364,7 @@ def make_all(data="combined_fe123", feature_set="B"):
     _table.clear()
     runs = load_log()
     charts = {
+        "final_test": lambda: plot_final_test(data),
         "auc_by_feature_set": lambda: plot_auc_by_feature_set(runs, data),
         "engineering_progression": lambda: plot_engineering_progression(runs),
         "engineering_fold_gains": plot_engineering_fold_gains,
