@@ -42,6 +42,13 @@ GROUP_LABELS = {"overall": "All applicants", "has_bureau": "Has bureau record", 
 GROUP_COLORS = {"overall": "#2a78d6", "has_bureau": "#1baf7a", "thin_file": "#eb6834"}
 SET_COLORS = {"A": "#104281", "B": "#2a78d6", "C": "#86b6ef"}
 ENGINEERED_COLOR, RAW_COLOR = "#6250d6", "#eda100"
+# Diverging pair for SHAP contributions, and a one-hue ramp for feature values.
+RAISES_RISK, LOWERS_RISK = "#e34948", "#2a78d6"
+VALUE_RAMP = matplotlib.colors.LinearSegmentedColormap.from_list("value", ["#cde2fb", "#104281"])
+# Uncorrected vs corrected probabilities; actual vs predicted; defaulters caught vs good payers flagged.
+UNCORRECTED_COLOR, CORRECTED_COLOR = RAW_COLOR, ENGINEERED_COLOR
+ACTUAL_COLOR, PREDICTED_COLOR = "#2a78d6", "#eb6834"
+CAUGHT_COLOR, WRONGLY_FLAGGED_COLOR = "#1baf7a", "#6250d6"
 INK, INK_2, MUTED, GRID, AXIS, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7", "#fcfcfb"
 
 plt.rcParams.update({
@@ -98,8 +105,9 @@ def _save(fig, name):
 
 
 def load_log():
-    """Latest logged run for every (dataset version, feature set)."""
+    """Latest logged run with the default settings for every (dataset version, feature set)."""
     runs = pd.read_csv(train.RESULTS_DIR / "log.csv")
+    runs = runs[runs["params"] == "default"]
     return runs.drop_duplicates(["data", "feature_set"], keep="last").set_index(["data", "feature_set"])
 
 
@@ -359,19 +367,225 @@ def plot_default_rate_by_decile(feature_set, data):
     return _save(fig, f"default_rate_by_decile_{feature_set}")
 
 
-def make_all(data="combined_fe123", feature_set="B"):
+def _load_result(name):
+    path = train.RESULTS_DIR / name
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def plot_tuning():
+    """Dots: mean fold AUC of every finished Optuna trial, with the best so far."""
+    tuning = _load_result("tuning_B_combined_fe123.json")
+    if tuning is None:
+        return None
+    trials = pd.DataFrame(tuning["trials"])
+    done = trials[trials["state"] == "COMPLETE"]
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    ax.axhline(trials["mean_fold_auc"].iloc[0], color=AXIS, linewidth=1.5, linestyle="--")
+    ax.annotate(f"default settings {trials['mean_fold_auc'].iloc[0]:.4f}",
+                (0, trials["mean_fold_auc"].iloc[0]), xytext=(4, -12), textcoords="offset points",
+                fontsize=8, color=INK_2)
+    ax.scatter(done["number"], done["mean_fold_auc"], s=40, color=GROUP_COLORS["overall"],
+               edgecolor=SURFACE, linewidth=1.2, zorder=3, label="finished trial")
+    best = done.set_index("number")["mean_fold_auc"].cummax()
+    ax.step(best.index, best.to_numpy(), where="post", color=INK, linewidth=2, label="best so far")
+    ax.annotate(f"{best.iloc[-1]:.4f}", (best.index[-1], best.iloc[-1]), xytext=(6, 4),
+                textcoords="offset points", fontsize=8, color=INK_2)
+    for row in trials.itertuples():
+        _record("tuning", step=row.number, auc=row.mean_fold_auc, variant=row.state)
+    ax.set_xlabel("Trial")
+    ax.set_ylabel("Mean fold AUC")
+    ax.grid(axis="y")
+    ax.legend(loc="lower right")
+    n_pruned = int((trials["state"] == "PRUNED").sum())
+    ax.set_title("Hyperparameter search, feature set B", pad=22)
+    _subtitle(ax, f"Optuna, {len(trials)} trials on the development set · {n_pruned} stopped early "
+                  "after 2 folds (not shown)")
+    return _save(fig, "tuning")
+
+
+def plot_shap_summary(feature_set, version):
+    """Beeswarm: SHAP value per applicant for the top features, coloured by feature value."""
+    path = train.RESULTS_DIR / f"shap_{feature_set}_{version}_sample.csv"
+    if not path.exists():
+        return None
+    sample = pd.read_csv(path)
+    features = [c.removeprefix("SHAP_") for c in sample if c.startswith("SHAP_")]
+    fig, ax = plt.subplots(figsize=(8.5, 6))
+    rng = np.random.default_rng(train.SEED)
+    for i, f in enumerate(features):
+        y = len(features) - 1 - i
+        shap, pct = sample[f"SHAP_{f}"].to_numpy(), sample[f"PCT_{f}"].to_numpy()
+        jitter = rng.uniform(-0.3, 0.3, len(shap))
+        missing = np.isnan(pct)
+        ax.scatter(shap[missing], y + jitter[missing], s=5, color=MUTED, alpha=0.5, linewidth=0)
+        points = ax.scatter(shap[~missing], y + jitter[~missing], s=5, c=pct[~missing],
+                            cmap=VALUE_RAMP, vmin=0, vmax=1, linewidth=0)
+        _record("shap_summary", feature_set=feature_set, data=version, feature=f,
+                gain=float(np.abs(shap).mean()))
+    ax.axvline(0, color=AXIS, linewidth=1)
+    ax.set_yticks(range(len(features)), features[::-1], fontsize=8)
+    ax.tick_params(axis="y", length=0)
+    ax.set_xlabel("SHAP value (log-odds): left lowers predicted risk, right raises it")
+    ax.grid(axis="x")
+    bar = fig.colorbar(points, ax=ax, pad=0.02, fraction=0.04)
+    bar.set_label("Feature value (percentile; grey = missing)", color=INK_2)
+    bar.set_ticks([0, 1], labels=["low", "high"])
+    bar.outline.set_visible(False)
+    ax.set_title(f"What drives the predictions, feature set {feature_set}", pad=22)
+    _subtitle(ax, f"Top {len(features)} features by mean |SHAP| · {len(sample):,} random test "
+                  f"applicants · data: {version}")
+    return _save(fig, f"shap_summary_{feature_set}")
+
+
+def plot_shap_examples(feature_set, version):
+    """Bars: feature contributions for two thin-file applicants, one high-risk, one low-risk."""
+    result = _load_result(f"shap_{feature_set}_{version}.json")
+    if result is None:
+        return None
+    examples = result["examples"]
+    fig, axes = plt.subplots(1, len(examples), figsize=(12, 4.6))
+    for ax, (label, ex) in zip(axes, examples.items()):
+        rows = ex["features"] + [{"feature": "all other features", "value": None,
+                                  "shap": ex["other_features_log_odds"]}]
+        names = []
+        for r in rows:
+            v = r["value"]
+            if v is None:
+                shown = "missing"
+            elif isinstance(v, (int, float)):
+                shown = f"{v:,.0f}" if abs(v) >= 1000 else f"{v:.3g}"
+            else:
+                shown = str(v)
+            names.append(r["feature"] if r["feature"] == "all other features" else f"{r['feature']} = {shown}")
+        values = np.array([r["shap"] for r in rows])
+        y = np.arange(len(rows))[::-1]
+        ax.barh(y, values, height=0.7, color=np.where(values > 0, RAISES_RISK, LOWERS_RISK))
+        for yy, v in zip(y, values):
+            ax.annotate(f"{v:+.2f}", (v, yy), xytext=(4 if v > 0 else -4, 0), textcoords="offset points",
+                        ha="left" if v > 0 else "right", va="center", fontsize=8, color=INK_2)
+            _record("shap_examples", feature_set=feature_set, data=version, variant=label, auc_gain=v)
+        ax.axvline(0, color=AXIS, linewidth=1)
+        ax.set_yticks(y, names, fontsize=8)
+        ax.tick_params(axis="y", length=0)
+        lim = np.abs(values).max() * 1.35
+        ax.set_xlim(-lim, lim)
+        ax.grid(axis="x")
+        ax.set_title(f"{label.capitalize()} thin-file applicant: predicted risk "
+                     f"{ex['predicted_risk']:.1%}", fontsize=10)
+    axes[0].set_xlabel("Contribution to risk (log-odds)")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in (RAISES_RISK, LOWERS_RISK)]
+    axes[-1].legend(handles, ["raises risk", "lowers risk"], loc="lower right")
+    fig.subplots_adjust(wspace=0.9)
+    _figure_header(fig, "Why the model scored these applicants as it did",
+                   f"SHAP contributions, top {len(rows) - 1} features each · two thin-file test "
+                   f"applicants · feature set {feature_set} · data: {version}")
+    return _save(fig, f"shap_examples_{feature_set}")
+
+
+def plot_calibration(feature_set, version, corrected="platt_by_group"):
+    """Reliability diagram: predicted vs actual default rate by tenth, before and after correction."""
+    result = _load_result(f"calibration_{feature_set}_{version}.json")
+    if result is None:
+        return None
+    bins = pd.DataFrame(result["bins"])
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.8), sharex=True, sharey=True)
+    for ax, group in zip(axes, ["overall", "thin_file"]):
+        top = bins["actual"].max() * 1.08
+        ax.plot([0, top], [0, top], color=AXIS, linewidth=1)
+        for method, color, name in [("raw", UNCORRECTED_COLOR, "model as trained"),
+                                    (corrected, CORRECTED_COLOR, "corrected per group")]:
+            part = bins[(bins["group"] == group) & (bins["method"] == method)]
+            ece = result["scores"][group][method]["ece"]
+            ax.plot(part["predicted"], part["actual"], marker="o", ms=7, color=color,
+                    markeredgecolor=SURFACE, markeredgewidth=1.5,
+                    label=f"{name} (avg gap {ece:.1%})")
+            for r in part.itertuples():
+                _record("calibration", feature_set=feature_set, data=version, group=group,
+                        variant=method, decile=r.bin + 1, auc=r.predicted, default_rate=r.actual)
+        s = result["scores"][group]
+        ax.text(0.03, 0.97, f"Average predicted {s['raw']['mean_predicted']:.1%} → "
+                f"{s[corrected]['mean_predicted']:.1%}\nActual {s['raw']['actual_rate']:.1%}",
+                transform=ax.transAxes, va="top", fontsize=8, color=INK_2)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1, decimals=0))
+        ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1, decimals=0))
+        ax.set_xlabel("Predicted default rate")
+        ax.set_title(GROUP_LABELS[group], fontsize=10)
+        ax.grid()
+        ax.legend(loc="lower right", fontsize=8)
+    axes[0].set_ylabel("Actual default rate")
+    _figure_header(fig, "Do predicted probabilities match reality?",
+                   f"Locked test set, 10 equal-size bins of predicted risk · on the grey line = "
+                   f"perfectly calibrated · feature set {feature_set} · data: {version}")
+    return _save(fig, f"calibration_{feature_set}")
+
+
+def plot_fairness(feature_set, version):
+    """Dot plots by group: actual vs predicted default rate, and who gets flagged at one cutoff."""
+    result = _load_result(f"fairness_{feature_set}_{version}.json")
+    if result is None:
+        return None
+    table = pd.DataFrame(result["groups"])
+    table = table[table["dimension"] != "all"]
+    order = {"gender": 0, "age": 1, "bureau": 2}
+    table = table.sort_values("dimension", key=lambda d: d.map(order), kind="stable")
+    labels = [f"{g} ({d})" if d == "age" else g for d, g in zip(table["dimension"], table["group"])]
+    y = np.arange(len(table))[::-1]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharey=True)
+    panels = [
+        (axes[0], [("default_rate", ACTUAL_COLOR, "actual default rate"),
+                   ("mean_predicted", PREDICTED_COLOR, "average predicted")], "Default rate"),
+        (axes[1], [("defaulters_caught", CAUGHT_COLOR, "defaulters flagged"),
+                   ("good_payers_flagged", WRONGLY_FLAGGED_COLOR, "good payers flagged")],
+         f"Share flagged as the riskiest {result['flag_share']:.0%}"),
+    ]
+    for ax, series, xlabel in panels:
+        for col, color, name in series:
+            ax.scatter(table[col], y, s=60, color=color, edgecolor=SURFACE, linewidth=1.5,
+                       zorder=3, label=name)
+        lo, hi = table[series[0][0]].to_numpy(), table[series[1][0]].to_numpy()
+        ax.hlines(y, np.minimum(lo, hi), np.maximum(lo, hi), color=GRID, linewidth=3, zorder=2)
+        for yy, a, b in zip(y, lo, hi):
+            ax.annotate(f"{a:.0%}" if a >= 0.1 else f"{a:.1%}", (a, yy), xytext=(0, 7),
+                        textcoords="offset points", ha="center", fontsize=7, color=INK_2)
+            ax.annotate(f"{b:.0%}" if b >= 0.1 else f"{b:.1%}", (b, yy), xytext=(0, -12),
+                        textcoords="offset points", ha="center", fontsize=7, color=INK_2)
+        for row in table.itertuples():
+            _record("fairness", feature_set=feature_set, data=version, group=row.group,
+                    **{col: getattr(row, col) for col, _, _ in series})
+        ax.xaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1, decimals=0))
+        ax.set_xlabel(xlabel)
+        ax.grid(axis="x")
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncols=2)
+    axes[0].set_yticks(y, labels)
+    axes[0].tick_params(axis="y", length=0)
+    for boundary in np.cumsum(table["dimension"].value_counts(sort=False).reindex(order).to_numpy())[:-1]:
+        for ax in axes:
+            ax.axhline(len(table) - boundary - 0.5, color=AXIS, linewidth=1)
+    _figure_header(fig, "How the model treats different groups",
+                   f"Locked test set · gender is not a model input · one cutoff for everyone · "
+                   f"feature set {feature_set} · data: {version}")
+    return _save(fig, f"fairness_{feature_set}")
+
+
+def make_all(data="combined_fe123", feature_set="B", param_set="default"):
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     _table.clear()
     runs = load_log()
+    version = data if param_set == "default" else f"{data}_{param_set}"
     charts = {
-        "final_test": lambda: plot_final_test(data),
+        "final_test": lambda: plot_final_test(version),
+        "tuning": plot_tuning,
+        "shap_summary": lambda: plot_shap_summary(feature_set, version),
+        "shap_examples": lambda: plot_shap_examples(feature_set, version),
+        "calibration": lambda: plot_calibration(feature_set, version),
+        "fairness": lambda: plot_fairness(feature_set, version),
         "auc_by_feature_set": lambda: plot_auc_by_feature_set(runs, data),
         "engineering_progression": lambda: plot_engineering_progression(runs),
         "engineering_fold_gains": plot_engineering_fold_gains,
         "pruning": lambda: plot_pruning(runs),
-        "top_features": lambda: plot_top_features(feature_set, data),
-        "roc_thin_file": lambda: plot_roc_thin_file(data),
-        "default_rate_by_decile": lambda: plot_default_rate_by_decile(feature_set, data),
+        "top_features": lambda: plot_top_features(feature_set, version),
+        "roc_thin_file": lambda: plot_roc_thin_file(version),
+        "default_rate_by_decile": lambda: plot_default_rate_by_decile(feature_set, version),
     }
     written = []
     for name, make in charts.items():
@@ -389,10 +603,12 @@ def main():
     parser.add_argument("--data", default="combined_fe123", choices=list(STEPS),
                         help="dataset version for the single-version charts")
     parser.add_argument("--features", default="B", choices=SETS,
-                        help="feature set for the top-features and decile charts")
+                        help="feature set for the single-model charts")
+    parser.add_argument("--params", default="default", choices=sorted(train.PARAM_SETS),
+                        help="model settings for the test-set, SHAP, calibration and fairness charts")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    make_all(args.data, args.features)
+    make_all(args.data, args.features, args.params)
 
 
 if __name__ == "__main__":

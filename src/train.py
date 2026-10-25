@@ -6,6 +6,7 @@ Usage:
     python -m src.train --features C         # no bureau information and no outside scores
     python -m src.train --data dataset/processed/combined.pkl      # raw features only
     python -m src.train --features B --final # score the locked test set once
+    python -m src.train --features B --params tuned   # settings found by src/tune.py
 
 Only labelled (train) applicants are used. 15% of them are locked away as a final test
 set (``split_holdout``); cross-validation runs on the other 85%. ``--final`` trains one
@@ -14,7 +15,8 @@ used to choose between versions.
 Every run uses the same holdout and the same stratified folds (fixed seed), so results
 from different feature sets and dataset versions can be compared directly.
 Results go to output/results/: a JSON summary, the out-of-fold predictions, and one
-row per run appended to log.csv (final scores: final_*.json and final.csv).
+row per run appended to log.csv. Final scores go to final_*.json and final.csv, with
+the test-set predictions (final_*_pred.csv) and the model (output/models/).
 """
 
 import argparse
@@ -38,6 +40,7 @@ N_FOLDS = 5
 HOLDOUT_SIZE = 0.15
 N_BOOTSTRAP = 1000
 RESULTS_DIR = Path(__file__).resolve().parents[1] / "output" / "results"
+MODELS_DIR = RESULTS_DIR.parent / "models"
 
 # Not features: an ID, the answer, and labels used to split the data and the results.
 NON_FEATURES = ["SK_ID_CURR", "TARGET", "IS_TRAIN", "IS_THIN_FILE"]
@@ -58,6 +61,31 @@ PARAMS = {
     "n_jobs": -1,
     "verbose": -1,
 }
+
+# Found by src/tune.py (Optuna, 40 trials, feature set B on combined_fe123, development set
+# only), rounded. Fewer columns per tree and much stronger regularisation than the defaults.
+TUNED_PARAMS = {
+    **PARAMS,
+    "num_leaves": 36,
+    "min_child_samples": 79,
+    "subsample": 0.95,
+    "colsample_bytree": 0.11,
+    "reg_lambda": 92.0,
+    "reg_alpha": 0.26,
+    "min_split_gain": 0.58,
+}
+
+PARAM_SETS = {"default": PARAMS, "tuned": TUNED_PARAMS}
+
+
+def version_name(data_path, param_set="default"):
+    """Name used in result files: the dataset version, plus "_tuned" for tuned settings."""
+    return data_path.stem if param_set == "default" else f"{data_path.stem}_{param_set}"
+
+
+def final_name(feature_set, data_path, param_set="default"):
+    """Stem of the files written by ``final`` (summary, test predictions, model)."""
+    return f"final_{feature_set}_{version_name(data_path, param_set)}"
 
 
 def _is_bureau_info(col):
@@ -114,6 +142,24 @@ def make_folds(y, n_folds=N_FOLDS, seed=SEED):
     return folds
 
 
+def fit_model(X, y, train_idx, params=PARAMS):
+    """Fit on ``train_idx``, early-stopping on a stratified 10% of it."""
+    fit_idx, stop_idx = train_test_split(train_idx, test_size=0.1, stratify=y[train_idx],
+                                         random_state=params["random_state"])
+    model = lgb.LGBMClassifier(**params)
+    model.fit(X.iloc[fit_idx], y[fit_idx],
+              eval_X=X.iloc[stop_idx], eval_y=y[stop_idx], eval_metric="auc",
+              callbacks=[lgb.early_stopping(100, verbose=False)])
+    return model
+
+
+def fit_fold(X, y, folds, fold, params=PARAMS):
+    """Train on every fold but ``fold``; return (rows of ``fold``, their predictions, model)."""
+    valid_idx = np.where(folds == fold)[0]
+    model = fit_model(X, y, np.where(folds != fold)[0], params)
+    return valid_idx, model.predict_proba(X.iloc[valid_idx])[:, 1], model
+
+
 def cross_validate(X, y, folds, params=PARAMS):
     """Out-of-fold predictions: each row is predicted by a model that never saw it.
 
@@ -124,14 +170,8 @@ def cross_validate(X, y, folds, params=PARAMS):
     n_trees = []
     importance = pd.Series(0.0, index=X.columns)
     for fold in np.unique(folds):
-        train_idx, valid_idx = np.where(folds != fold)[0], np.where(folds == fold)[0]
-        fit_idx, stop_idx = train_test_split(train_idx, test_size=0.1, stratify=y[train_idx],
-                                             random_state=params["random_state"])
-        model = lgb.LGBMClassifier(**params)
-        model.fit(X.iloc[fit_idx], y[fit_idx],
-                  eval_X=X.iloc[stop_idx], eval_y=y[stop_idx], eval_metric="auc",
-                  callbacks=[lgb.early_stopping(100, verbose=False)])
-        oof[valid_idx] = model.predict_proba(X.iloc[valid_idx])[:, 1]
+        valid_idx, pred, model = fit_fold(X, y, folds, fold, params)
+        oof[valid_idx] = pred
         n_trees.append(model.best_iteration_)
         importance += pd.Series(model.booster_.feature_importance("gain"), index=X.columns)
         log.info("fold %d: AUC %.4f (%d trees)", fold, roc_auc_score(y[valid_idx], oof[valid_idx]),
@@ -169,7 +209,8 @@ def bootstrap_auc(y, pred, n=N_BOOTSTRAP, seed=SEED):
 def _append_log(summary):
     """One row per run in output/results/log.csv, to compare runs side by side."""
     row = {"time": time.strftime("%Y-%m-%d %H:%M"), "data": summary["data"],
-           "feature_set": summary["feature_set"], "n_features": summary["n_features"]}
+           "feature_set": summary["feature_set"], "params": summary["param_set"],
+           "n_features": summary["n_features"]}
     for group in ["overall", "has_bureau", "thin_file"]:
         row[f"auc_{group}"] = round(summary[group]["auc"], 4)
         row[f"std_{group}"] = round(summary[group]["auc_fold_std"], 4)
@@ -177,8 +218,15 @@ def _append_log(summary):
     pd.DataFrame([row]).to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
-def run(feature_set, data_path):
+def _params(param_set):
+    if PARAM_SETS[param_set] is None:
+        raise ValueError(f"no {param_set} settings yet: run src.tune and fill in TUNED_PARAMS")
+    return PARAM_SETS[param_set]
+
+
+def run(feature_set, data_path, param_set="default"):
     start = time.perf_counter()
+    params = _params(param_set)
     dev, holdout = split_holdout(load_train(data_path))
     features = select_features(dev.columns, feature_set)
     X, y = dev[features], dev["TARGET"].to_numpy()
@@ -187,24 +235,25 @@ def run(feature_set, data_path):
     log.info("%s, feature set %s: %d applicants (%d held out), %d features", data_path.stem,
              feature_set, len(X), len(holdout), len(features))
 
-    oof, n_trees, importance = cross_validate(X, y, folds)
+    oof, n_trees, importance = cross_validate(X, y, folds, params)
     summary = {
         "model": "lightgbm",
         "data": data_path.stem,
         "feature_set": feature_set,
+        "param_set": param_set,
         "n_features": len(features),
         "holdout_applicants": len(holdout),
         "seed": SEED,
         "n_folds": N_FOLDS,
         "trees_per_fold": n_trees,
-        "params": PARAMS,
+        "params": params,
         **evaluate(y, oof, folds, thin),
         "top_features_by_gain": importance.sort_values(ascending=False).head(25).round(1).to_dict(),
         "minutes": round((time.perf_counter() - start) / 60, 1),
     }
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    name = f"lightgbm_{feature_set}_{data_path.stem}"
+    name = f"lightgbm_{feature_set}_{version_name(data_path, param_set)}"
     (RESULTS_DIR / f"{name}.json").write_text(json.dumps(summary, indent=2))
     io.save_dataset(pd.DataFrame({"SK_ID_CURR": dev["SK_ID_CURR"], "FOLD": folds,
                                   "TARGET": y, "IS_THIN_FILE": thin, "PRED": oof}),
@@ -217,23 +266,19 @@ def run(feature_set, data_path):
     return summary
 
 
-def final(feature_set, data_path):
+def final(feature_set, data_path, param_set="default"):
     """Train on the whole development set and score the locked test set once."""
     start = time.perf_counter()
+    params = _params(param_set)
     dev, holdout = split_holdout(load_train(data_path))
     features = select_features(dev.columns, feature_set)
-    y_dev = dev["TARGET"].to_numpy()
-    fit_idx, stop_idx = train_test_split(np.arange(len(dev)), test_size=0.1, stratify=y_dev,
-                                         random_state=SEED)
-    model = lgb.LGBMClassifier(**PARAMS)
-    model.fit(dev[features].iloc[fit_idx], y_dev[fit_idx],
-              eval_X=dev[features].iloc[stop_idx], eval_y=y_dev[stop_idx], eval_metric="auc",
-              callbacks=[lgb.early_stopping(100, verbose=False)])
+    model = fit_model(dev[features], dev["TARGET"].to_numpy(), np.arange(len(dev)), params)
 
     y, thin = holdout["TARGET"].to_numpy(), holdout["IS_THIN_FILE"].to_numpy()
     pred = model.predict_proba(holdout[features])[:, 1]
     summary = {"model": "lightgbm", "data": data_path.stem, "feature_set": feature_set,
-               "n_features": len(features), "trees": model.best_iteration_, "seed": SEED}
+               "param_set": param_set, "n_features": len(features),
+               "trees": model.best_iteration_, "seed": SEED, "params": params}
     for name, mask in [("overall", np.ones(len(y), bool)), ("thin_file", thin == 1),
                        ("has_bureau", thin == 0)]:
         summary[name] = {"auc": roc_auc_score(y[mask], pred[mask]),
@@ -245,9 +290,15 @@ def final(feature_set, data_path):
     summary["minutes"] = round((time.perf_counter() - start) / 60, 1)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    name = f"final_{feature_set}_{data_path.stem}"
+    name = final_name(feature_set, data_path, param_set)
     (RESULTS_DIR / f"{name}.json").write_text(json.dumps(summary, indent=2))
-    row = {"data": summary["data"], "feature_set": feature_set, "n_features": len(features)}
+    io.save_dataset(pd.DataFrame({"SK_ID_CURR": holdout["SK_ID_CURR"], "TARGET": y,
+                                  "IS_THIN_FILE": thin, "PRED": pred}),
+                    RESULTS_DIR / f"{name}_pred.csv")
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    model.booster_.save_model(MODELS_DIR / f"{name}.txt", num_iteration=model.best_iteration_)
+    row = {"data": summary["data"], "feature_set": feature_set, "params": param_set,
+           "n_features": len(features)}
     for group in ["overall", "has_bureau", "thin_file"]:
         row[f"auc_{group}"] = round(summary[group]["auc"], 4)
         row[f"ci_low_{group}"], row[f"ci_high_{group}"] = (round(v, 4) for v in summary[group]["auc_95ci"])
@@ -260,11 +311,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--features", choices=sorted(FEATURE_SETS), default="A")
     parser.add_argument("--data", type=Path, default=io.DATA_DIR / "processed" / "combined_fe123.pkl")
+    parser.add_argument("--params", choices=sorted(PARAM_SETS), default="default",
+                        help="model settings: the defaults, or those found by src/tune.py")
     parser.add_argument("--final", action="store_true", help="score the locked test set once")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    (final if args.final else run)(args.features, args.data)
+    (final if args.final else run)(args.features, args.data, args.params)
 
 
 if __name__ == "__main__":

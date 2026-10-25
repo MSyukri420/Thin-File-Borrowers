@@ -1,4 +1,4 @@
-"""Tests for src/io.py, src/preprocess.py and src/train.py.
+"""Tests for the pipeline in src/: building the dataset, training, and checking the model.
 
     pytest                        # everything (~3 min, real data included)
     pytest -k "not RealData"      # synthetic tests only (~2 s)
@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import io, preprocess, train
+from src import calibration, explain, fairness, io, preprocess, train
 
 NAN = np.nan
 SENTINEL = preprocess.DAYS_SENTINEL
@@ -536,6 +536,86 @@ def test_evaluate_reports_each_group():
     assert out["thin_file"]["auc"] == 0.5
     assert out["thin_file"]["applicants"] == 8
     assert out["overall"]["default_rate"] == 0.5
+
+
+def test_result_file_names():
+    path = io.DATA_DIR / "processed" / "combined_fe123.pkl"
+    assert train.version_name(path) == "combined_fe123"
+    assert train.version_name(path, "tuned") == "combined_fe123_tuned"
+    assert train.final_name("B", path, "tuned") == "final_B_combined_fe123_tuned"
+
+
+def test_bootstrap_interval_contains_the_auc():
+    rng = np.random.default_rng(0)
+    y = rng.integers(0, 2, 500)
+    pred = y + rng.normal(0, 1, 500)
+    low, high = train.bootstrap_auc(y, pred, n=200)
+    assert low < train.roc_auc_score(y, pred) < high
+
+
+def test_tuning_settings_stay_in_range():
+    optuna = pytest.importorskip("optuna")
+    from src import tune
+    fixed = {"num_leaves": 8, "min_child_samples": 1000, "colsample_bytree": 0.1, "subsample": 1.0,
+             "reg_lambda": 100.0, "reg_alpha": 1e-3, "min_split_gain": 0.0}
+    params = tune.suggest(optuna.trial.FixedTrial(fixed))
+    assert {k: params[k] for k in fixed} == fixed
+    assert params["learning_rate"] == train.PARAMS["learning_rate"]
+
+
+# --------------------------------------------------------------------------- #
+# Calibration, fairness and SHAP (src/calibration.py, src/fairness.py, src/explain.py)
+# --------------------------------------------------------------------------- #
+
+def test_calibration_error_measures_the_gap():
+    # two bins: 50 applicants predicted 10% with 5 defaults, 50 predicted 30% with 15
+    y = np.array([1] * 5 + [0] * 45 + [1] * 15 + [0] * 35)
+    pred = np.repeat([0.1, 0.3], 50)
+    assert calibration.expected_calibration_error(y, pred, n_bins=2) == pytest.approx(0.0)
+    assert calibration.expected_calibration_error(y, pred + 0.05, n_bins=2) == pytest.approx(0.05)
+    table = calibration.calibration_table(y, np.linspace(0, 1, 100))
+    assert len(table) == calibration.N_BINS and table["applicants"].sum() == 100
+
+
+def test_corrections_remove_a_constant_bias():
+    rng = np.random.default_rng(0)
+    p = rng.uniform(0.02, 0.4, 20000)
+    y = (rng.uniform(size=p.size) < p).astype(int)
+    halved = p / 2                                     # predicts half the real risk
+    for fix in calibration.fit_corrections(y, halved).values():
+        assert fix(halved).mean() == pytest.approx(y.mean(), abs=0.005)
+
+
+def test_fairness_groups():
+    holdout = pd.DataFrame({"CODE_GENDER": pd.Categorical(["F", "M", NAN]),
+                            "DAYS_BIRTH": [-20 * 365.25 - 1, -45 * 365.25, -70 * 365.25],
+                            "IS_THIN_FILE": [1, 0, 0]})
+    groups = fairness.applicant_groups(holdout)
+    assert groups["gender"].tolist()[:2] == ["female", "male"] and pd.isna(groups["gender"][2])
+    assert groups["age"].tolist() == ["under 30", "40-49", "60+"]
+    assert groups["bureau"].tolist() == ["thin file", "has bureau record", "has bureau record"]
+
+
+def test_fairness_metrics():
+    y = np.array([1, 1, 0, 0, 0])
+    pred = np.array([0.9, 0.2, 0.8, 0.1, 0.1])
+    flagged = pred >= 0.5
+    m = fairness.group_metrics(y, pred, flagged)
+    assert m["flagged"] == pytest.approx(0.4)
+    assert m["defaulters_caught"] == pytest.approx(0.5)
+    assert m["good_payers_flagged"] == pytest.approx(1 / 3)
+    assert m["default_rate_if_flagged"] == pytest.approx(0.5)
+
+
+def test_shap_values_add_up_to_the_score():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame({"a": rng.normal(size=400), "b": rng.normal(size=400),
+                      "c": pd.Categorical(rng.choice(["x", "y", "z"], 400))})
+    y = (X["a"] + (X["c"] == "x") + rng.normal(0, 0.5, 400) > 0.5).astype(int)
+    booster = train.lgb.LGBMClassifier(n_estimators=20, verbose=-1).fit(X, y).booster_
+    shap, baseline = explain.shap_values(booster, X)       # asserts the sum itself
+    assert shap.shape == X.shape
+    assert shap["a"].abs().mean() > shap["b"].abs().mean()
 
 
 # --------------------------------------------------------------------------- #
