@@ -81,16 +81,19 @@ def run(feature_set, data_path, param_set="default"):
                            **explain_example(shap.iloc[i], X.iloc[i], pred[i], baseline)}
 
     top = importance.index[:N_TOP].tolist()
+    categorical = [f for f in top if X[f].dtype == "category"]
     rows = np.random.default_rng(train.SEED).choice(len(X), size=min(N_SAMPLE, len(X)), replace=False)
-    # feature values as percentiles within the test set, so every feature shares one colour scale
-    percentile = X[top].apply(lambda c: (c.cat.codes.where(c.notna()) if c.dtype == "category" else c)
-                              .rank(pct=True))
+    # numeric values as percentiles within the test set, so every feature shares one colour
+    # scale; categories have no order, so they get no value (drawn grey, like missing values)
+    percentile = X[top].apply(lambda c: pd.Series(np.nan, index=c.index) if c.dtype == "category"
+                              else c.rank(pct=True))
     sample = pd.concat([shap.iloc[rows][top].add_prefix("SHAP_"),
                         percentile.iloc[rows].add_prefix("PCT_")], axis=1)
     io.save_dataset(sample.reset_index(drop=True), train.RESULTS_DIR / f"shap_{feature_set}_{version}_sample.csv")
 
     result = {"feature_set": feature_set, "version": version, "baseline_log_odds": baseline,
-              "mean_abs_shap": importance.head(40).round(5).to_dict("index"), "examples": examples}
+              "mean_abs_shap": importance.head(40).round(5).to_dict("index"),
+              "categorical_features": categorical, "examples": examples}
     (train.RESULTS_DIR / f"shap_{feature_set}_{version}.json").write_text(json.dumps(result, indent=2))
     log.info("top features by mean |SHAP|:\n%s", importance.head(N_TOP).round(4).to_string())
     for label, ex in examples.items():

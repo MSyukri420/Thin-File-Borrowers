@@ -5,8 +5,9 @@ Usage:
     python -m src.tune --trials 10
 
 Each trial trains on the same 5 folds as src/train.py and is scored by its mean fold AUC
-(all applicants). Trials that are clearly worse than the median after two folds are
-stopped early. The first trial is the current default settings, as a reference.
+(all applicants). From the second fold on, a trial whose running mean falls below the
+median of earlier trials at the same fold is stopped early (Optuna's MedianPruner). The
+first trial is the default settings, as a reference.
 The locked test set is never loaded into a model here.
 Results go to output/results/tuning_B_combined_fe123.json; copy the best settings into
 TUNED_PARAMS in src/train.py.

@@ -7,7 +7,8 @@ Usage:
 Needs the cross-validation run and the --final run of src/train.py for the same version.
 Corrections are fitted on the development set's out-of-fold predictions only (isotonic
 regression, Platt scaling, and Platt scaling fitted separately for thin-file applicants)
-and then checked on the locked test set, so the test set never shapes them. Results go to output/results/calibration_<set>_<version>.json.
+and then checked on the locked test set, so the test set never shapes them.
+Results go to output/results/calibration_<set>_<version>.json.
 """
 
 import argparse

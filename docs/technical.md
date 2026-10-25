@@ -27,7 +27,7 @@ Added in three batches, each tested against the version before it:
 
 - **Batch 1, payment behaviour**: instalments: days late, late flag, paid ÷ due, underpaid flag, plus late-in-the-last-year versions; POS/cash loans: late flag overall and in the last year.
 - **Batch 2, credit cards and past applications**: card utilisation (overall and last year), drawings ÷ limit, payment ÷ minimum due; past applications: asked ÷ granted, total cost ratio (annuity × payments ÷ credit), refused in the last 2 years, whether the most recent application was refused.
-- **Batch 3, the application itself**: credit ÷ annuity (roughly the loan term), annuity ÷ income, credit ÷ goods price, employed days ÷ age, income per family member, mean outside score, bureau debt ÷ bureau credit.
+- **Batch 3, the application itself**: credit ÷ annuity (roughly how many payments the loan takes), annuity ÷ income, credit ÷ goods price, employed days ÷ age, income per family member, mean outside score, bureau debt ÷ bureau credit.
 
 ## Evaluation
 
@@ -59,8 +59,7 @@ The coin flip is a random ranking. The single-score baseline ranks applicants by
 | + Batch 1 | 0.783 | 0.772 | 0.763 | 0.775 | 0.742 | 0.751 |
 | + Batch 2 | 0.785 | 0.775 | 0.765 | 0.775 | 0.743 | 0.753 |
 | + Batch 3 | 0.787 | 0.777 | 0.767 | 0.779 | 0.747 | 0.756 |
-
-| Batch 3, tuned | 0.789 | 0.779 | 0.770 | 0.781 | 0.750 | 0.761 |
+| + Batch 3, tuned | 0.789 | 0.779 | 0.770 | 0.781 | 0.750 | 0.761 |
 
 All three batches together improved AUC in every fold, for every set and both groups. Batch 2 was the weakest: +0.0008 for thin-file applicants in set B, better in only 3 of 5 folds.
 
@@ -90,7 +89,7 @@ Every change is within ±0.0015, smaller than the fold-to-fold spread, so all fe
 
 ### Tuning
 
-An Optuna search (TPE sampler, seed 42) on set B with engineered features, scored by mean fold AUC on the development set's 5 folds. The first trial was the default settings. Trials clearly below the median after two folds were stopped early: 32 of 40 finished.
+An Optuna search (TPE sampler, seed 42) on set B with engineered features, scored by mean fold AUC on the development set's 5 folds. The first trial was the default settings. From the second fold on, a trial whose running mean fell below the median of earlier trials was stopped early (Optuna's median pruner): 32 of 40 finished.
 
 | Setting | Searched | Default | Tuned |
 |---|---|---|---|
@@ -130,7 +129,7 @@ Corrections were fitted on the development set's out-of-fold predictions only, t
 
 - **Overall, the model is already calibrated**: 7.9% predicted vs 8.1% actual, with every bin close to the diagonal.
 - **Thin-file applicants are under-predicted** by about 0.8 points (86% of the training data has a bureau record). One correction for everyone barely moves it.
-- **A separate correction for thin-file applicants fixes it** (10.2% vs 10.1%) without changing the ranking. Brier score moves only in the fourth decimal place for every correction.
+- **A separate correction for thin-file applicants fixes it** (10.2% vs 10.1%). It keeps the order within each group, and overall test AUC stays at 0.776. Brier score moves only in the fourth decimal place for every correction.
 
 ## Fairness
 
@@ -161,7 +160,7 @@ SHAP values split each applicant's score into one contribution per feature, in l
 
 Most important features for the final model, by mean absolute SHAP value on the test set: `EXT_SOURCE_2`, `EXT_SOURCE_1`, credit ÷ annuity, credit ÷ goods price, `DAYS_EMPLOYED`, `ORGANIZATION_TYPE`, total paid on past instalments, `DAYS_BIRTH`, `DAYS_ID_PUBLISH` and the last due date of past loans. The order is nearly the same for thin-file applicants. Four of the top five are the outside scores or hand-made ratios.
 
-[`shap_examples_B.png`](figures/shap_examples_B.png) explains two thin-file test applicants, one at the 95th percentile of predicted risk (30.7%) and one at the 10th (1.5%). For the high-risk one, a very low `EXT_SOURCE_2` and a long implied loan term (credit ÷ annuity of 12.6) push the risk up most.
+[`shap_examples_B.png`](figures/shap_examples_B.png) explains two thin-file test applicants, one at the 95th percentile of predicted risk (30.7%) and one at the 10th (1.5%). For the high-risk one, a very low `EXT_SOURCE_2` (0.018) and a short repayment period (credit ÷ annuity of 12.6, lower than for 86% of applicants) push the risk up most.
 
 ## Data
 

@@ -391,7 +391,7 @@ def plot_tuning():
     ax.annotate(f"{best.iloc[-1]:.4f}", (best.index[-1], best.iloc[-1]), xytext=(6, 4),
                 textcoords="offset points", fontsize=8, color=INK_2)
     for row in trials.itertuples():
-        _record("tuning", step=row.number, auc=row.mean_fold_auc, variant=row.state)
+        _record("tuning", trial=row.number, state=row.state, mean_fold_auc=row.mean_fold_auc)
     ax.set_xlabel("Trial")
     ax.set_ylabel("Mean fold AUC")
     ax.grid(axis="y")
@@ -399,7 +399,7 @@ def plot_tuning():
     n_pruned = int((trials["state"] == "PRUNED").sum())
     ax.set_title("Hyperparameter search, feature set B", pad=22)
     _subtitle(ax, f"Optuna, {len(trials)} trials on the development set · {n_pruned} stopped early "
-                  "after 2 folds (not shown)")
+                  "for falling below the median (not shown)")
     return _save(fig, "tuning")
 
 
@@ -410,6 +410,7 @@ def plot_shap_summary(feature_set, version):
         return None
     sample = pd.read_csv(path)
     features = [c.removeprefix("SHAP_") for c in sample if c.startswith("SHAP_")]
+    categorical = (_load_result(f"shap_{feature_set}_{version}.json") or {}).get("categorical_features", [])
     fig, ax = plt.subplots(figsize=(8.5, 6))
     rng = np.random.default_rng(train.SEED)
     for i, f in enumerate(features):
@@ -421,14 +422,15 @@ def plot_shap_summary(feature_set, version):
         points = ax.scatter(shap[~missing], y + jitter[~missing], s=5, c=pct[~missing],
                             cmap=VALUE_RAMP, vmin=0, vmax=1, linewidth=0)
         _record("shap_summary", feature_set=feature_set, data=version, feature=f,
-                gain=float(np.abs(shap).mean()))
+                mean_abs_shap=float(np.abs(shap).mean()))
     ax.axvline(0, color=AXIS, linewidth=1)
-    ax.set_yticks(range(len(features)), features[::-1], fontsize=8)
+    labels = [f"{f} (category)" if f in categorical else f for f in features]
+    ax.set_yticks(range(len(features)), labels[::-1], fontsize=8)
     ax.tick_params(axis="y", length=0)
     ax.set_xlabel("SHAP value (log-odds): left lowers predicted risk, right raises it")
     ax.grid(axis="x")
     bar = fig.colorbar(points, ax=ax, pad=0.02, fraction=0.04)
-    bar.set_label("Feature value (percentile; grey = missing)", color=INK_2)
+    bar.set_label("Feature value (percentile; grey = missing or a category)", color=INK_2)
     bar.set_ticks([0, 1], labels=["low", "high"])
     bar.outline.set_visible(False)
     ax.set_title(f"What drives the predictions, feature set {feature_set}", pad=22)
@@ -463,7 +465,9 @@ def plot_shap_examples(feature_set, version):
         for yy, v in zip(y, values):
             ax.annotate(f"{v:+.2f}", (v, yy), xytext=(4 if v > 0 else -4, 0), textcoords="offset points",
                         ha="left" if v > 0 else "right", va="center", fontsize=8, color=INK_2)
-            _record("shap_examples", feature_set=feature_set, data=version, variant=label, auc_gain=v)
+        for name, v in zip(names, values):
+            _record("shap_examples", feature_set=feature_set, data=version, example=label,
+                    feature=name, shap=v)
         ax.axvline(0, color=AXIS, linewidth=1)
         ax.set_yticks(y, names, fontsize=8)
         ax.tick_params(axis="y", length=0)
@@ -501,7 +505,8 @@ def plot_calibration(feature_set, version, corrected="platt_by_group"):
                     label=f"{name} (avg gap {ece:.1%})")
             for r in part.itertuples():
                 _record("calibration", feature_set=feature_set, data=version, group=group,
-                        variant=method, decile=r.bin + 1, auc=r.predicted, default_rate=r.actual)
+                        correction=method, decile=r.bin + 1, predicted_rate=r.predicted,
+                        default_rate=r.actual)
         s = result["scores"][group]
         ax.text(0.03, 0.97, f"Average predicted {s['raw']['mean_predicted']:.1%} → "
                 f"{s[corrected]['mean_predicted']:.1%}\nActual {s['raw']['actual_rate']:.1%}",

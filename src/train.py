@@ -218,15 +218,9 @@ def _append_log(summary):
     pd.DataFrame([row]).to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
-def _params(param_set):
-    if PARAM_SETS[param_set] is None:
-        raise ValueError(f"no {param_set} settings yet: run src.tune and fill in TUNED_PARAMS")
-    return PARAM_SETS[param_set]
-
-
 def run(feature_set, data_path, param_set="default"):
     start = time.perf_counter()
-    params = _params(param_set)
+    params = PARAM_SETS[param_set]
     dev, holdout = split_holdout(load_train(data_path))
     features = select_features(dev.columns, feature_set)
     X, y = dev[features], dev["TARGET"].to_numpy()
@@ -269,7 +263,7 @@ def run(feature_set, data_path, param_set="default"):
 def final(feature_set, data_path, param_set="default"):
     """Train on the whole development set and score the locked test set once."""
     start = time.perf_counter()
-    params = _params(param_set)
+    params = PARAM_SETS[param_set]
     dev, holdout = split_holdout(load_train(data_path))
     features = select_features(dev.columns, feature_set)
     model = fit_model(dev[features], dev["TARGET"].to_numpy(), np.arange(len(dev)), params)
