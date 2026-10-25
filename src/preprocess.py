@@ -5,6 +5,7 @@ Usage:
     df = build_dataset()             # train + test, one row per SK_ID_CURR
 
     python -m src.preprocess         # build and save to dataset/processed/combined.pkl
+    python -m src.preprocess --batches 1 2 3   # + hand-made features -> combined_fe123.pkl
 
 Train and test rows are stacked together (``IS_TRAIN`` tells them apart, ``TARGET``
 is NaN for test). Only row-level cleaning is done here: anything fitted on the data
@@ -18,6 +19,14 @@ plain rule (see ``_aggregate``):
     PREFIX_COLUMN_VALUE_SHARE     for each text column, share of rows with that value
 The only added columns are ``IS_TRAIN`` and ``IS_THIN_FILE`` (no bureau record), which
 label rows for splitting and evaluation and are not model features.
+
+Hand-made features are opt-in, in batches, and always have ``_FE_`` in their name:
+    1  lateness and payment behaviour (instalments, POS), all time and last 12 months
+    2  credit-card use and previous-application history
+    3  application ratios (+ an EXT_SOURCE mean and a bureau debt ratio)
+Batches 1-2 are added to the raw history rows before they are summarised, so they get
+the same four statistics, e.g. ``INST_FE_IS_LATE_MEAN`` = share of late instalments.
+The default build stays raw-only so it remains the baseline the batches are measured against.
 """
 
 import argparse
@@ -95,7 +104,80 @@ def clean_application(train, test):
     return app
 
 
-def aggregate_bureau(bureau, bureau_balance):
+def _late_flag(days_past_due):
+    """1.0 if past due, 0.0 if on time, NaN if unknown."""
+    return days_past_due.gt(0).astype("float32").where(days_past_due.notna())
+
+
+def _ratio(num, den):
+    """num / den, with a zero denominator treated as unknown rather than infinite."""
+    return num / den.replace(0, np.nan)
+
+
+# --------------------------------------------------------------------------- #
+# Hand-made features (opt-in, see ``build_dataset(batches=...)``)
+#   Batches 1-2 work on raw history rows before they are summarised; recent-window
+#   columns are NaN outside the window, so their mean/max cover the window only.
+#   Batch 3 works on the combined applicant-level frame.
+# --------------------------------------------------------------------------- #
+
+def add_pos_cash_features(pos):
+    """Batch 1: share of months past due, all time and in the last 12 months."""
+    pos["FE_IS_LATE"] = _late_flag(pos["SK_DPD"])
+    pos["FE_IS_LATE_1Y"] = pos["FE_IS_LATE"].where(pos["MONTHS_BALANCE"] >= -12)
+
+
+def add_installments_features(inst):
+    """Batch 1: lateness and payment behaviour per instalment, all time and last 12 months."""
+    days_late = inst["DAYS_ENTRY_PAYMENT"] - inst["DAYS_INSTALMENT"]
+    inst["FE_DPD"] = days_late.clip(lower=0)  # paying early counts as 0 days late
+    inst["FE_IS_LATE"] = _late_flag(days_late)
+    inst["FE_PAY_RATIO"] = _ratio(inst["AMT_PAYMENT"], inst["AMT_INSTALMENT"])
+    inst["FE_UNDERPAID"] = (inst["AMT_INSTALMENT"] - inst["AMT_PAYMENT"]).clip(lower=0)
+    recent = inst["DAYS_INSTALMENT"] > -365
+    inst["FE_DPD_1Y"] = inst["FE_DPD"].where(recent)
+    inst["FE_IS_LATE_1Y"] = inst["FE_IS_LATE"].where(recent)
+
+
+def add_credit_card_features(cc):
+    """Batch 2: how much of the limit is used and how much is repaid, per card month."""
+    limit = cc["AMT_CREDIT_LIMIT_ACTUAL"]
+    cc["FE_UTILIZATION"] = _ratio(cc["AMT_BALANCE"], limit)
+    cc["FE_DRAWING_LIMIT_RATIO"] = _ratio(cc["AMT_DRAWINGS_CURRENT"], limit)
+    cc["FE_PAY_MIN_RATIO"] = _ratio(cc["AMT_PAYMENT_CURRENT"], cc["AMT_INST_MIN_REGULARITY"])
+    cc["FE_UTILIZATION_1Y"] = cc["FE_UTILIZATION"].where(cc["MONTHS_BALANCE"] >= -12)
+
+
+def add_previous_application_features(prev):
+    """Batch 2: asked vs granted, cost of credit, and recent / latest refusals."""
+    prev["FE_ASK_GRANT_RATIO"] = _ratio(prev["AMT_APPLICATION"], prev["AMT_CREDIT"])
+    # Total repaid / borrowed: above 1 is the interest and fees Home Credit charged.
+    prev["FE_TOTAL_COST_RATIO"] = _ratio(prev["AMT_ANNUITY"] * prev["CNT_PAYMENT"], prev["AMT_CREDIT"])
+    refused = prev["NAME_CONTRACT_STATUS"].eq("Refused").astype("float32")
+    prev["FE_IS_REFUSED_2Y"] = refused.where(prev["DAYS_DECISION"] > -730)
+    # The applicant's most recent decision (several applications can share that day).
+    latest = prev["DAYS_DECISION"].eq(prev.groupby("SK_ID_CURR")["DAYS_DECISION"].transform("max"))
+    prev["FE_LAST_IS_REFUSED"] = refused.where(latest)
+
+
+def add_applicant_features(df):
+    """Batch 3: ratios of application columns, plus two summaries that need joined data."""
+    df["APP_FE_CREDIT_ANNUITY_RATIO"] = _ratio(df["AMT_CREDIT"], df["AMT_ANNUITY"])  # ~months to repay
+    df["APP_FE_ANNUITY_INCOME_RATIO"] = _ratio(df["AMT_ANNUITY"], df["AMT_INCOME_TOTAL"])
+    df["APP_FE_CREDIT_GOODS_RATIO"] = _ratio(df["AMT_CREDIT"], df["AMT_GOODS_PRICE"])
+    df["APP_FE_EMPLOYED_BIRTH_RATIO"] = _ratio(df["DAYS_EMPLOYED"], df["DAYS_BIRTH"])
+    df["APP_FE_INCOME_PER_PERSON"] = _ratio(df["AMT_INCOME_TOTAL"], df["CNT_FAM_MEMBERS"])
+    # Uses EXT_SOURCE_3, so it counts as bureau information (see src/train.py).
+    df["EXT_SOURCE_FE_MEAN"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].mean(axis=1)
+    df["BUREAU_FE_DEBT_CREDIT_RATIO"] = _ratio(df["BUREAU_AMT_CREDIT_SUM_DEBT_SUM"],
+                                               df["BUREAU_AMT_CREDIT_SUM_SUM"])
+
+
+# --------------------------------------------------------------------------- #
+# Clean + summarise each history table
+# --------------------------------------------------------------------------- #
+
+def aggregate_bureau(bureau, bureau_balance, batches=()):
     """Credit bureau loans at other lenders (BUREAU_*) and their monthly statuses (BB_*)."""
     _replace_placeholders(bureau)
     # End/update dates before the loan was opened are impossible (some are ~115 years ago).
@@ -114,28 +196,36 @@ def aggregate_bureau(bureau, bureau_balance):
     return _aggregate(bureau, "BUREAU").join(bb)
 
 
-def aggregate_previous_application(prev):
+def aggregate_previous_application(prev, batches=()):
     """Earlier applications to Home Credit."""
     _replace_placeholders(prev)
     prev["SELLERPLACE_AREA"] = prev["SELLERPLACE_AREA"].replace(-1, np.nan)
+    if 2 in batches:
+        add_previous_application_features(prev)
     return _aggregate(prev, "PREV")
 
 
-def aggregate_pos_cash(pos):
+def aggregate_pos_cash(pos, batches=()):
     """Monthly snapshots of previous point-of-sale and cash loans."""
     _replace_placeholders(pos)
+    if 1 in batches:
+        add_pos_cash_features(pos)
     return _aggregate(pos, "POS")
 
 
-def aggregate_installments(inst):
+def aggregate_installments(inst, batches=()):
     """Each scheduled repayment of previous Home Credit loans vs what was actually paid."""
     _replace_placeholders(inst)
+    if 1 in batches:
+        add_installments_features(inst)
     return _aggregate(inst, "INST")
 
 
-def aggregate_credit_card(cc):
+def aggregate_credit_card(cc, batches=()):
     """Monthly snapshots of previous Home Credit credit cards."""
     _replace_placeholders(cc)
+    if 2 in batches:
+        add_credit_card_features(cc)
     return _aggregate(cc, "CC")
 
 
@@ -167,8 +257,17 @@ def finalize(df):
     return df
 
 
-def build_dataset(data_dir=io.DATA_DIR):
-    """Read, clean and combine every table into one row per applicant (train + test)."""
+FE_BATCHES = (1, 2, 3)
+
+
+def build_dataset(data_dir=io.DATA_DIR, batches=()):
+    """Read, clean and combine every table into one row per applicant (train + test).
+
+    ``batches`` picks the hand-made feature batches to add, e.g. ``(1, 2)``; none by default.
+    """
+    unknown = set(batches) - set(FE_BATCHES)
+    if unknown:
+        raise ValueError(f"unknown feature batches {sorted(unknown)}, expected some of {FE_BATCHES}")
     start = time.perf_counter()
 
     df = clean_application(io.read_table("application_train", data_dir),
@@ -177,11 +276,13 @@ def build_dataset(data_dir=io.DATA_DIR):
 
     # Tables are read one step at a time so only one large raw table is in memory.
     for aggregate, tables in AGGREGATES:
-        agg = aggregate(*[io.read_table(name, data_dir) for name in tables])
+        agg = aggregate(*[io.read_table(name, data_dir) for name in tables], batches=batches)
         df = df.join(agg, on="SK_ID_CURR")
         log.info("%s: +%d columns (%.0fs)", aggregate.__name__, agg.shape[1],
                  time.perf_counter() - start)
 
+    if 3 in batches:
+        add_applicant_features(df)
     df = finalize(df)
     log.info("combined: %s rows x %d columns, %.0f MB (%.0fs)", f"{len(df):,}", df.shape[1],
              df.memory_usage(deep=True).sum() / 1e6, time.perf_counter() - start)
@@ -191,11 +292,17 @@ def build_dataset(data_dir=io.DATA_DIR):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, default=io.DATA_DIR)
-    parser.add_argument("--out", type=Path, default=io.DATA_DIR / "processed" / "combined.pkl")
+    parser.add_argument("--batches", type=int, nargs="*", choices=FE_BATCHES, default=[],
+                        help="hand-made feature batches to add, e.g. --batches 1 2")
+    parser.add_argument("--out", type=Path,
+                        help="default: dataset/processed/combined.pkl, or combined_fe12.pkl for --batches 1 2")
     args = parser.parse_args()
+    batches = tuple(sorted(set(args.batches)))
+    name = "combined_fe" + "".join(map(str, batches)) if batches else "combined"
+    out = args.out or io.DATA_DIR / "processed" / f"{name}.pkl"
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    io.save_dataset(build_dataset(args.data_dir), args.out)
+    io.save_dataset(build_dataset(args.data_dir, batches), out)
 
 
 if __name__ == "__main__":

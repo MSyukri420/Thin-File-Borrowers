@@ -1,7 +1,7 @@
-"""Tests for src/io.py and src/preprocess.py.
+"""Tests for src/io.py, src/preprocess.py and src/train.py.
 
-    python -m pytest test.py                  # everything (~1 min, real data included)
-    python -m pytest test.py -k "not RealData" # synthetic tests only (~1 s)
+    python -m pytest test.py                  # everything (~3 min, real data included)
+    python -m pytest test.py -k "not RealData" # synthetic tests only (~2 s)
 
 The synthetic tests write tiny hand-made CSVs with known answers, so each cleaning
 and aggregation rule is checked exactly. The real-data tests run the full build on
@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import io, preprocess
+from src import io, preprocess, train
 
 NAN = np.nan
 SENTINEL = preprocess.DAYS_SENTINEL
@@ -41,7 +41,16 @@ TABLES = {
         "NAME_FAMILY_STATUS": ["Married", "Unknown"],
         "ORGANIZATION_TYPE": ["Business Entity Type 3", "XNA"],
         "DAYS_EMPLOYED": [-1000, SENTINEL],
+        "DAYS_BIRTH": [-10000, -8000],
         "AMT_INCOME_TOTAL": [100000.0, 50000.0],
+        "CNT_FAM_MEMBERS": [2.0, 1.0],
+        "AMT_CREDIT": [1000.0, 600.0],
+        # zero annuity -> credit / annuity must be NaN, not inf
+        "AMT_ANNUITY": [100.0, 0.0],
+        "AMT_GOODS_PRICE": [800.0, 600.0],
+        "EXT_SOURCE_1": [0.2, NAN],
+        "EXT_SOURCE_2": [0.4, 0.5],
+        "EXT_SOURCE_3": [0.6, NAN],
     },
     "application_test": {
         "SK_ID_CURR": [3],
@@ -49,7 +58,15 @@ TABLES = {
         "NAME_FAMILY_STATUS": ["Single"],
         "ORGANIZATION_TYPE": ["Self-employed"],
         "DAYS_EMPLOYED": [-500],
+        "DAYS_BIRTH": [-9000],
         "AMT_INCOME_TOTAL": [80000.0],
+        "CNT_FAM_MEMBERS": [1.0],
+        "AMT_CREDIT": [500.0],
+        "AMT_ANNUITY": [50.0],
+        "AMT_GOODS_PRICE": [500.0],
+        "EXT_SOURCE_1": [0.3],
+        "EXT_SOURCE_2": [0.3],
+        "EXT_SOURCE_3": [0.3],
     },
     "bureau": {
         "SK_ID_CURR": [1, 1, 3],
@@ -113,6 +130,9 @@ TABLES = {
         "AMT_CREDIT_LIMIT_ACTUAL": [1000.0, 0.0],
         "AMT_DRAWINGS_CURRENT": [100.0, 0.0],
         "CNT_DRAWINGS_CURRENT": [1, 0],
+        # zero minimum payment -> payment / minimum must be NaN, not inf
+        "AMT_PAYMENT_CURRENT": [50.0, 0.0],
+        "AMT_INST_MIN_REGULARITY": [25.0, 0.0],
         "SK_DPD": [0, 3],
         "SK_DPD_DEF": [0, 0],
     },
@@ -138,7 +158,7 @@ def df(data_dir):
 
 def test_read_table_returns_raw_data(data_dir):
     app = io.read_table("application_train", data_dir)
-    assert app.shape == (2, 7)
+    assert app.shape == (2, 15)
     # io only reads; placeholders are still there for preprocess to clean
     assert app["DAYS_EMPLOYED"].tolist() == [-1000, SENTINEL]
     assert app["CODE_GENDER"].tolist() == ["F", "XNA"]
@@ -358,6 +378,168 @@ def test_summaries_stay_nan_without_history(df):
     for col in ["BUREAU_DAYS_CREDIT_MIN", "BUREAU_AMT_CREDIT_SUM_SUM", "PREV_AMT_CREDIT_MEAN",
                 "PREV_NAME_CONTRACT_STATUS_APPROVED_SHARE", "INST_AMT_PAYMENT_SUM", "CC_SK_DPD_MAX"]:
         assert np.isnan(df.loc[2, col]), col
+
+
+# --------------------------------------------------------------------------- #
+# Engineered features (opt-in)
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(scope="module")
+def df_fe(data_dir):
+    return preprocess.build_dataset(data_dir, batches=preprocess.FE_BATCHES).set_index("SK_ID_CURR")
+
+
+def test_engineered_build_only_adds_fe_columns(df, df_fe):
+    added = df_fe.columns.difference(df.columns)
+    assert len(added) > 0 and all("_FE_" in c for c in added)
+    pd.testing.assert_frame_equal(df_fe[df.columns], df)
+
+
+def test_installments_features(df_fe):
+    # instalments: early by 5, late by 10, never paid; the last one is due 0
+    row = df_fe.loc[1]
+    assert row["INST_FE_DPD_MEAN"] == pytest.approx(5.0)  # early counts as 0, unpaid is unknown
+    assert row["INST_FE_DPD_MAX"] == 10
+    assert row["INST_FE_IS_LATE_MEAN"] == pytest.approx(0.5)
+    assert row["INST_FE_IS_LATE_SUM"] == 1
+    assert row["INST_FE_PAY_RATIO_MEAN"] == pytest.approx(0.8)  # due 0 is unknown, not inf
+    assert row["INST_FE_PAY_RATIO_MIN"] == pytest.approx(0.6)
+    assert row["INST_FE_UNDERPAID_SUM"] == pytest.approx(40.0)
+    assert np.isnan(df_fe.loc[2, "INST_FE_IS_LATE_MEAN"])
+
+
+def test_recent_window_ignores_older_rows():
+    inst = pd.DataFrame({
+        "SK_ID_CURR": [1, 1],
+        "DAYS_INSTALMENT": [-400, -100],     # first one is over a year old
+        "DAYS_ENTRY_PAYMENT": [-380, -100],  # 20 days late, then on time
+        "AMT_INSTALMENT": [100.0, 100.0],
+        "AMT_PAYMENT": [100.0, 100.0],
+    })
+    row = preprocess.aggregate_installments(inst, batches=(1,)).loc[1]
+    assert row["INST_FE_IS_LATE_MEAN"] == pytest.approx(0.5)
+    assert row["INST_FE_IS_LATE_1Y_MEAN"] == 0
+    assert row["INST_FE_DPD_1Y_MAX"] == 0
+
+
+def test_pos_cash_features(df_fe):
+    assert df_fe.loc[1, "POS_FE_IS_LATE_MEAN"] == pytest.approx(0.5)
+    assert df_fe.loc[1, "POS_FE_IS_LATE_1Y_MEAN"] == pytest.approx(0.5)
+
+
+def test_batches_are_independent():
+    cc = pd.DataFrame(TABLES["credit_card_balance"])
+    assert not any("_FE_" in c for c in preprocess.aggregate_credit_card(cc, batches=(1,)).columns)
+    with pytest.raises(ValueError, match="unknown feature batches"):
+        preprocess.build_dataset(batches=(4,))
+
+
+def test_credit_card_features(df_fe):
+    # month 2 has a zero limit and zero minimum payment -> unknown, not inf
+    row = df_fe.loc[1]
+    assert row["CC_FE_UTILIZATION_MEAN"] == pytest.approx(0.5)
+    assert row["CC_FE_UTILIZATION_1Y_MEAN"] == pytest.approx(0.5)
+    assert row["CC_FE_DRAWING_LIMIT_RATIO_MEAN"] == pytest.approx(0.1)
+    assert row["CC_FE_PAY_MIN_RATIO_MEAN"] == pytest.approx(2.0)
+
+
+def test_previous_application_features(df_fe):
+    row = df_fe.loc[1]
+    assert row["PREV_FE_ASK_GRANT_RATIO_MEAN"] == pytest.approx(1.25)  # granted 0 is unknown
+    assert row["PREV_FE_TOTAL_COST_RATIO_MEAN"] == pytest.approx(1.5)  # 100 x 12 / 800
+    # the refused application has no decision date, so it is in neither window
+    assert row["PREV_FE_IS_REFUSED_2Y_MEAN"] == 0
+    assert row["PREV_FE_LAST_IS_REFUSED_MEAN"] == 0
+
+
+def test_refusal_windows():
+    prev = pd.DataFrame({
+        "SK_ID_PREV": [1, 2, 3],
+        "SK_ID_CURR": [7, 7, 7],
+        "NAME_CONTRACT_STATUS": ["Refused", "Approved", "Refused"],
+        "DAYS_DECISION": [-1000, -500, -10],  # the first is over 2 years old
+        "AMT_APPLICATION": [100.0, 100.0, 100.0],
+        "AMT_CREDIT": [100.0, 100.0, 100.0],
+        "AMT_ANNUITY": [10.0, 10.0, 10.0],
+        "CNT_PAYMENT": [12.0, 12.0, 12.0],
+        "SELLERPLACE_AREA": [1, 1, 1],
+    })
+    row = preprocess.aggregate_previous_application(prev, batches=(2,)).loc[7]
+    assert row["PREV_FE_IS_REFUSED_2Y_MEAN"] == pytest.approx(0.5)
+    assert row["PREV_FE_LAST_IS_REFUSED_MEAN"] == 1
+
+
+def test_applicant_features(df_fe):
+    row = df_fe.loc[1]
+    assert row["APP_FE_CREDIT_ANNUITY_RATIO"] == pytest.approx(10.0)
+    assert row["APP_FE_ANNUITY_INCOME_RATIO"] == pytest.approx(0.001)
+    assert row["APP_FE_CREDIT_GOODS_RATIO"] == pytest.approx(1.25)
+    assert row["APP_FE_EMPLOYED_BIRTH_RATIO"] == pytest.approx(0.1)
+    assert row["APP_FE_INCOME_PER_PERSON"] == pytest.approx(50000.0)
+    assert row["EXT_SOURCE_FE_MEAN"] == pytest.approx(0.4)
+    assert row["BUREAU_FE_DEBT_CREDIT_RATIO"] == pytest.approx(0.1)  # 400 / 4000 after clipping
+    # applicant 2: zero annuity, pensioner, thin file, only EXT_SOURCE_2 known
+    thin = df_fe.loc[2]
+    assert np.isnan(thin["APP_FE_CREDIT_ANNUITY_RATIO"])
+    assert np.isnan(thin["APP_FE_EMPLOYED_BIRTH_RATIO"])
+    assert np.isnan(thin["BUREAU_FE_DEBT_CREDIT_RATIO"])
+    assert thin["EXT_SOURCE_FE_MEAN"] == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------- #
+# Training helpers (src/train.py)
+# --------------------------------------------------------------------------- #
+
+def test_holdout_is_fixed_stratified_and_separate():
+    labelled = pd.DataFrame({"SK_ID_CURR": np.arange(1000), "TARGET": [1] * 100 + [0] * 900})
+    dev, holdout = train.split_holdout(labelled)
+    assert len(holdout) == 150 and holdout["TARGET"].mean() == pytest.approx(0.1)
+    assert not set(dev["SK_ID_CURR"]) & set(holdout["SK_ID_CURR"])
+    # row order of the input does not change who is held out
+    _, again = train.split_holdout(labelled.sample(frac=1, random_state=0))
+    assert again["SK_ID_CURR"].tolist() == holdout["SK_ID_CURR"].tolist()
+
+def test_feature_sets(df):
+    columns = df.reset_index().columns
+    a, b, c = (set(train.select_features(columns, s)) for s in "ABC")
+    for col in ["SK_ID_CURR", "TARGET", "IS_TRAIN", "IS_THIN_FILE", "CODE_GENDER"]:
+        assert col not in a, col
+    # B removes everything that only exists with a bureau record
+    assert a - b == {col for col in a if col.startswith(("BUREAU_", "BB_")) or col == "EXT_SOURCE_3"}
+    assert {"PREV_COUNT", "EXT_SOURCE_1", "EXT_SOURCE_2"} <= b
+    assert train.select_features(["AMT_REQ_CREDIT_BUREAU_YEAR"], "B") == []
+    # C also removes the outside scores
+    assert not any(col.startswith("EXT_SOURCE_") for col in c)
+
+
+def test_feature_sets_with_engineered_columns(df_fe):
+    columns = df_fe.reset_index().columns
+    b, c = (set(train.select_features(columns, s)) for s in "BC")
+    # the EXT_SOURCE mean includes EXT_SOURCE_3 and the debt ratio comes from the bureau
+    assert "EXT_SOURCE_FE_MEAN" not in b and "BUREAU_FE_DEBT_CREDIT_RATIO" not in b
+    # Home Credit history and application ratios are allowed without bureau data
+    assert {"INST_FE_IS_LATE_MEAN", "CC_FE_UTILIZATION_MEAN", "APP_FE_CREDIT_ANNUITY_RATIO"} <= c
+
+
+def test_folds_are_stratified_and_reproducible():
+    y = np.array([1] * 20 + [0] * 80)
+    folds = train.make_folds(y)
+    assert (folds == train.make_folds(y)).all()
+    for fold in range(train.N_FOLDS):
+        assert y[folds == fold].mean() == pytest.approx(0.2)
+
+
+def test_evaluate_reports_each_group():
+    # 2 folds x (bureau, thin) x (good, bad): ranked perfectly with a bureau record, guessed without
+    y = np.array([0, 1] * 8)
+    thin = np.array([0, 0, 1, 1] * 4)
+    folds = np.repeat([0, 1], 8)
+    pred = np.where(thin == 1, 0.5, 0.1 + 0.8 * y)
+    out = train.evaluate(y, pred, folds, thin)
+    assert out["has_bureau"]["auc"] == 1.0
+    assert out["thin_file"]["auc"] == 0.5
+    assert out["thin_file"]["applicants"] == 8
+    assert out["overall"]["default_rate"] == 0.5
 
 
 # --------------------------------------------------------------------------- #
